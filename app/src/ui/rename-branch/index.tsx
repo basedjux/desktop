@@ -5,9 +5,11 @@ import { Repository } from '../../models/repository'
 import { Branch } from '../../models/branch'
 import { sanitizedBranchName } from '../../lib/sanitize-branch'
 import { TextBox } from '../lib/text-box'
+import { Row } from '../lib/row'
 import { Button } from '../lib/button'
 import { ButtonGroup } from '../lib/button-group'
 import { Dialog, DialogContent, DialogFooter } from '../dialog'
+import { renderBranchNameWarning } from '../lib/branch-name-warnings'
 
 interface IRenameBranchProps {
   readonly dispatcher: Dispatcher
@@ -19,45 +21,47 @@ interface IRenameBranchState {
   readonly newName: string
 }
 
-export class RenameBranch extends React.Component<IRenameBranchProps, IRenameBranchState> {
+export class RenameBranch extends React.Component<
+  IRenameBranchProps,
+  IRenameBranchState
+> {
   public constructor(props: IRenameBranchProps) {
     super(props)
 
     this.state = { newName: props.branch.name }
   }
 
-  private renderError() {
-    const sanitizedName = sanitizedBranchName(this.state.newName)
-    if (sanitizedName !== this.state.newName) {
-      return <div>Will be created as {sanitizedName}</div>
-    } else {
-      return null
-    }
-  }
-
   public render() {
-    const disabled = !this.state.newName.length
+    const disabled =
+      !this.state.newName.length || /^\s*$/.test(this.state.newName)
     return (
       <Dialog
-        id='rename-branch'
-        title={ __DARWIN__ ? 'Rename Branch' : 'Rename branch'}
+        id="rename-branch"
+        title={__DARWIN__ ? 'Rename Branch' : 'Rename branch'}
         onDismissed={this.cancel}
         onSubmit={this.renameBranch}
       >
         <DialogContent>
-          <TextBox
-            label='Name'
-            autoFocus={true}
-            value={this.state.newName}
-            onChange={this.onNameChange}
-            onKeyDown={this.onKeyDown}/>
-
-          {this.renderError()}
+          <Row>
+            <TextBox
+              label="Name"
+              autoFocus={true}
+              value={this.state.newName}
+              onChange={this.onNameChange}
+              onKeyDown={this.onKeyDown}
+            />
+          </Row>
+          {renderBranchNameWarning(
+            this.state.newName,
+            sanitizedBranchName(this.state.newName)
+          )}
         </DialogContent>
 
         <DialogFooter>
           <ButtonGroup>
-            <Button type='submit' disabled={disabled}>Rename {this.props.branch.name}</Button>
+            <Button type="submit" disabled={disabled}>
+              Rename {this.props.branch.name}
+            </Button>
             <Button onClick={this.cancel}>Cancel</Button>
           </ButtonGroup>
         </DialogFooter>
@@ -81,7 +85,11 @@ export class RenameBranch extends React.Component<IRenameBranchProps, IRenameBra
 
   private renameBranch = () => {
     const name = sanitizedBranchName(this.state.newName)
-    this.props.dispatcher.renameBranch(this.props.repository, this.props.branch, name)
+    this.props.dispatcher.renameBranch(
+      this.props.repository,
+      this.props.branch,
+      name
+    )
     this.props.dispatcher.closePopup()
   }
 }

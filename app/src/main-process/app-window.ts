@@ -1,18 +1,16 @@
 import { BrowserWindow, ipcMain, Menu, app, dialog } from 'electron'
 import { Emitter, Disposable } from 'event-kit'
-
-import { SharedProcess } from '../shared-process/shared-process'
-import { WindowState, windowStateChannelName } from '../lib/window-state'
+import { registerWindowStateChangedEvents } from '../lib/window-state'
 import { MenuEvent } from './menu'
-import { URLActionType } from '../lib/parse-url'
+import { URLActionType } from '../lib/parse-app-url'
 import { ILaunchStats } from '../lib/stats'
 import { menuFromElectronMenu } from '../models/app-menu'
+import { now } from './now'
 
 let windowStateKeeper: any | null = null
 
 export class AppWindow {
   private window: Electron.BrowserWindow
-  private sharedProcess: SharedProcess
   private emitter = new Emitter()
 
   private _loadTime: number | null = null
@@ -21,7 +19,7 @@ export class AppWindow {
   private minWidth = 960
   private minHeight = 660
 
-  public constructor(sharedProcess: SharedProcess) {
+  public constructor() {
     if (!windowStateKeeper) {
       // `electron-window-state` requires Electron's `screen` module, which can
       // only be required after the app has emitted `ready`. So require it
@@ -34,7 +32,7 @@ export class AppWindow {
       defaultHeight: this.minHeight,
     })
 
-    const windowOptions: Electron.BrowserWindowOptions = {
+    const windowOptions: Electron.BrowserWindowConstructorOptions = {
       x: savedWindowState.x,
       y: savedWindowState.y,
       width: savedWindowState.width,
@@ -55,9 +53,9 @@ export class AppWindow {
     }
 
     if (__DARWIN__) {
-        windowOptions.titleBarStyle = 'hidden'
+      windowOptions.titleBarStyle = 'hidden'
     } else if (__WIN32__) {
-        windowOptions.frame = false
+      windowOptions.frame = false
     }
 
     this.window = new BrowserWindow(windowOptions)
@@ -68,7 +66,7 @@ export class AppWindow {
       quitting = true
     })
 
-    ipcMain.on('will-quit', (event: Electron.IpcMainEvent) => {
+    ipcMain.on('will-quit', (event: Electron.IpcMessageEvent) => {
       quitting = true
       event.returnValue = true
     })
@@ -80,12 +78,10 @@ export class AppWindow {
       this.window.on('close', e => {
         if (!quitting) {
           e.preventDefault()
-          this.window.hide()
+          Menu.sendActionToFirstResponder('hide:')
         }
       })
     }
-
-    this.sharedProcess = sharedProcess
   }
 
   public load() {
@@ -100,7 +96,7 @@ export class AppWindow {
       this._rendererReadyTime = null
       this._loadTime = null
 
-      startLoad = Date.now()
+      startLoad = now()
     })
 
     this.window.webContents.once('did-finish-load', () => {
@@ -108,8 +104,7 @@ export class AppWindow {
         this.window.webContents.openDevTools()
       }
 
-      const now = Date.now()
-      this._loadTime = now - startLoad
+      this._loadTime = now() - startLoad
 
       this.maybeEmitDidLoad()
     })
@@ -124,16 +119,19 @@ export class AppWindow {
     })
 
     // TODO: This should be scoped by the window.
-    ipcMain.once('renderer-ready', (event: Electron.IpcMainEvent, readyTime: number) => {
-      this._rendererReadyTime = readyTime
+    ipcMain.once(
+      'renderer-ready',
+      (event: Electron.IpcMessageEvent, readyTime: number) => {
+        this._rendererReadyTime = readyTime
 
-      this.maybeEmitDidLoad()
-    })
+        this.maybeEmitDidLoad()
+      }
+    )
 
     this.window.on('focus', () => this.window.webContents.send('focus'))
     this.window.on('blur', () => this.window.webContents.send('blur'))
 
-    this.registerWindowStateChangedEvents()
+    registerWindowStateChangedEvents(this.window)
 
     this.window.loadURL(`file://${__dirname}/index.html`)
   }
@@ -143,7 +141,9 @@ export class AppWindow {
    * signalled that it's ready.
    */
   private maybeEmitDidLoad() {
-    if (!this.rendererLoaded) { return }
+    if (!this.rendererLoaded) {
+      return
+    }
 
     this.emitter.emit('did-load', null)
   }
@@ -151,38 +151,6 @@ export class AppWindow {
   /** Is the page loaded and has the renderer signalled it's ready? */
   private get rendererLoaded(): boolean {
     return !!this.loadTime && !!this.rendererReadyTime
-  }
-
-  /**
-   * Sets up message passing to the render process when the window state changes.
-   *
-   * We've definied 'window state' as one of minimized, normal, maximized, and
-   * full-screen. These states will be sent over the window-state-changed channel
-   */
-  private registerWindowStateChangedEvents() {
-    this.window.on('enter-full-screen', () => this.sendWindowStateEvent('full-screen'))
-
-    // So this is a bit of a hack. If we call window.isFullScreen directly after
-    // receiving the leave-full-screen event it'll return true which isn't what
-    // we're after. So we'll say that we're transitioning to 'normal' even though
-    // we might be maximized. This works because electron will emit a 'maximized'
-    // event after 'leave-full-screen' if the state prior to full-screen was maximized.
-    this.window.on('leave-full-screen', () => this.sendWindowStateEvent('normal'))
-
-    this.window.on('maximize', () => this.sendWindowStateEvent('maximized'))
-    this.window.on('minimize', () => this.sendWindowStateEvent('minimized'))
-    this.window.on('unmaximize', () => this.sendWindowStateEvent('normal'))
-    this.window.on('restore', () => this.sendWindowStateEvent('normal'))
-    this.window.on('hide', () => this.sendWindowStateEvent('hidden'))
-    this.window.on('show', () => this.sendWindowStateEvent('normal'))
-  }
-
-  /**
-   * Short hand convenience function for sending a window state change event
-   * over the window-state-changed channel to the render process.
-   */
-  private sendWindowStateEvent(state: WindowState) {
-    this.window.webContents.send(windowStateChannelName, state)
   }
 
   public onClose(fn: () => void) {
@@ -199,6 +167,11 @@ export class AppWindow {
 
   public isMinimized() {
     return this.window.isMinimized()
+  }
+
+  /** Is the window currently visible? */
+  public isVisible() {
+    return this.window.isVisible()
   }
 
   public restore() {
@@ -243,15 +216,30 @@ export class AppWindow {
   }
 
   /** Send a certificate error to the renderer. */
-  public sendCertificateError(certificate: Electron.Certificate, error: string, url: string) {
-    this.window.webContents.send('certificate-error', { certificate, error, url })
+  public sendCertificateError(
+    certificate: Electron.Certificate,
+    error: string,
+    url: string
+  ) {
+    this.window.webContents.send('certificate-error', {
+      certificate,
+      error,
+      url,
+    })
   }
 
-  public showCertificateTrustDialog(certificate: Electron.Certificate, message: string) {
+  public showCertificateTrustDialog(
+    certificate: Electron.Certificate,
+    message: string
+  ) {
     // The Electron type definitions don't include `showCertificateTrustDialog`
     // yet.
     const d = dialog as any
-    d.showCertificateTrustDialog(this.window, { certificate, message }, () => {})
+    d.showCertificateTrustDialog(
+      this.window,
+      { certificate, message },
+      () => {}
+    )
   }
 
   /** Report the exception to the renderer. */
@@ -264,18 +252,6 @@ export class AppWindow {
       name: error.name,
     }
     this.window.webContents.send('main-process-exception', friendlyError)
-  }
-
-  /** Report an auto updater error to the renderer. */
-  public sendAutoUpdaterError(error: Error) {
-    // `Error` can't be JSONified so it doesn't transport nicely over IPC. So
-    // we'll just manually copy the properties we care about.
-    const friendlyError = {
-      stack: error.stack,
-      message: error.message,
-      name: error.name,
-    }
-    this.window.webContents.send('auto-updater-error', friendlyError)
   }
 
   /**
@@ -295,5 +271,9 @@ export class AppWindow {
    */
   public get rendererReadyTime(): number | null {
     return this._rendererReadyTime
+  }
+
+  public destroy() {
+    this.window.destroy()
   }
 }

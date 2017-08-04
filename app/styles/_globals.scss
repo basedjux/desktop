@@ -101,6 +101,7 @@ button {
 
 .blankslate {
   background: var(--box-alt-background-color);
+  color: var(--text-secondary-color);
   display: flex;
   flex: 1;
   align-items: center;
@@ -136,4 +137,13 @@ button {
 // http://stackoverflow.com/questions/7538771/what-is-webkit-focus-ring-color
 :focus {
   outline: auto 5px var(--focus-color);
+}
+.more-dropdown {
+  color: var(--text-color) !important;
+  margin-left: var(--spacing);
+
+  .octicon {
+    margin-left: var(--spacing-third);
+    width: 8px;
+  }
 }

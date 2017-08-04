@@ -95,13 +95,15 @@ export interface IToolbarButtonProps {
    * operation is currently in flight.
    */
   readonly progressValue?: number
+
+  readonly role?: string
+  readonly ariaExpanded?: boolean
 }
 
 /**
  * A general purpose toolbar button
  */
-export class ToolbarButton extends React.Component<IToolbarButtonProps, void> {
-
+export class ToolbarButton extends React.Component<IToolbarButtonProps, {}> {
   public innerButton: Button | null = null
 
   private onClick = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -135,31 +137,45 @@ export class ToolbarButton extends React.Component<IToolbarButtonProps, void> {
 
   public render() {
     const icon = this.props.icon
-      ? <Octicon symbol={this.props.icon} className={classNames('icon', this.props.iconClassName)} />
+      ? <Octicon
+          symbol={this.props.icon}
+          className={classNames('icon', this.props.iconClassName)}
+        />
       : null
 
     const className = classNames(
       'toolbar-button',
       { 'has-progress': this.props.progressValue !== undefined },
-      this.props.className,
+      this.props.className
     )
 
-    const progressValue = this.props.progressValue !== undefined
-      ? Math.round(clamp(this.props.progressValue, 0, 1) * 100) / 100
-      : undefined
+    const progressValue =
+      this.props.progressValue !== undefined
+        ? Math.round(clamp(this.props.progressValue, 0, 1) * 100) / 100
+        : undefined
 
-    const progress = progressValue !== undefined
-      ? <div className='progress' style={{ transform: `scaleX(${progressValue})` }} />
-      : undefined
+    const progress =
+      progressValue !== undefined
+        ? <div
+            className="progress"
+            style={{ transform: `scaleX(${progressValue})` }}
+          />
+        : undefined
 
     return (
-      <div className={className} onKeyDown={this.props.onKeyDown} title={this.props.tooltip}>
+      <div
+        className={className}
+        onKeyDown={this.props.onKeyDown}
+        title={this.props.tooltip}
+      >
         <Button
           onClick={this.onClick}
           ref={this.onButtonRef}
           disabled={this.props.disabled}
           onMouseEnter={this.props.onMouseEnter}
           tabIndex={this.props.tabIndex}
+          role={this.props.role}
+          ariaExpanded={this.props.ariaExpanded}
         >
           {progress}
           {icon}
@@ -171,34 +187,44 @@ export class ToolbarButton extends React.Component<IToolbarButtonProps, void> {
   }
 
   private renderText() {
-
-    if (this.props.title === undefined && this.props.description === undefined) {
+    if (
+      this.props.title === undefined &&
+      this.props.description === undefined
+    ) {
       return null
     }
 
-    const title = this.props.title !== undefined
-      ? <div className='title'>{this.props.title}</div>
-      : null
+    const title =
+      this.props.title !== undefined
+        ? <div className="title">
+            {this.props.title}
+          </div>
+        : null
 
-    const description = this.props.description !== undefined
-      ? <div className='description'>{this.props.description}</div>
-      : null
+    const description =
+      this.props.description !== undefined
+        ? <div className="description">
+            {this.props.description}
+          </div>
+        : null
 
     const style = this.props.style || ToolbarButtonStyle.Standard
     switch (style) {
       case ToolbarButtonStyle.Standard:
         return (
-          <div className='text'>
-            {title}
+          <div className="text">
             {description}
+            {title}
           </div>
         )
 
       case ToolbarButtonStyle.Subtitle:
         return (
-          <div className='text'>
+          <div className="text">
+            <div className="title">
+              {this.props.title}
+            </div>
             {description}
-            <div className='title'>{this.props.title}</div>
           </div>
         )
 

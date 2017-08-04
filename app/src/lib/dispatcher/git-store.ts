@@ -2,10 +2,9 @@ import * as Fs from 'fs'
 import * as Path from 'path'
 import { Emitter, Disposable } from 'event-kit'
 import { Repository } from '../../models/repository'
-import { WorkingDirectoryFileChange, FileStatus } from '../../models/status'
+import { WorkingDirectoryFileChange, AppFileStatus } from '../../models/status'
 import { Branch, BranchType } from '../../models/branch'
 import { Tip, TipState } from '../../models/tip'
-import { Account } from '../../models/account'
 import { Commit } from '../../models/commit'
 import { IRemote } from '../../models/remote'
 import { IFetchProgress } from '../app-state'
@@ -35,7 +34,11 @@ import {
   getStatus,
   IStatusResult,
   getCommit,
+  getConfigValue,
+  revertCommit,
 } from '../git'
+import { IGitAccount } from '../git/authentication'
+import { RetryAction, RetryActionType } from '../retry-actions'
 
 /** The number of commits to load from history per batch. */
 const CommitBatchSize = 100
@@ -47,10 +50,10 @@ const RecentBranchesLimit = 5
 
 /** File statuses which indicate the file exists on disk. */
 const OnDiskStatuses = new Set([
-  FileStatus.New,
-  FileStatus.Modified,
-  FileStatus.Renamed,
-  FileStatus.Conflicted,
+  AppFileStatus.New,
+  AppFileStatus.Modified,
+  AppFileStatus.Renamed,
+  AppFileStatus.Conflicted,
 ])
 
 /**
@@ -58,12 +61,11 @@ const OnDiskStatuses = new Set([
  * repository.
  */
 const CommittedStatuses = new Set([
-  FileStatus.Modified,
-  FileStatus.Deleted,
-  FileStatus.Renamed,
-  FileStatus.Conflicted,
+  AppFileStatus.Modified,
+  AppFileStatus.Deleted,
+  AppFileStatus.Renamed,
+  AppFileStatus.Conflicted,
 ])
-
 
 /** A commit message summary and description. */
 export interface ICommitMessage {
@@ -129,7 +131,9 @@ export class GitStore {
   }
 
   /** Register a function to be called when the store loads new commits. */
-  public onDidLoadNewCommits(fn: (commits: ReadonlyArray<Commit>) => void): Disposable {
+  public onDidLoadNewCommits(
+    fn: (commits: ReadonlyArray<Commit>) => void
+  ): Disposable {
     return this.emitter.on('did-load-new-commits', fn)
   }
 
@@ -140,12 +144,18 @@ export class GitStore {
 
   /** Load history from HEAD. */
   public async loadHistory() {
-    if (this.requestsInFight.has(LoadingHistoryRequestKey)) { return }
+    if (this.requestsInFight.has(LoadingHistoryRequestKey)) {
+      return
+    }
 
     this.requestsInFight.add(LoadingHistoryRequestKey)
 
-    let commits = await this.performFailableOperation(() => getCommits(this.repository, 'HEAD', CommitBatchSize))
-    if (!commits) { return }
+    let commits = await this.performFailableOperation(() =>
+      getCommits(this.repository, 'HEAD', CommitBatchSize)
+    )
+    if (!commits) {
+      return
+    }
 
     let existingHistory = this._history
     if (existingHistory.length > 0) {
@@ -164,7 +174,7 @@ export class GitStore {
       }
     }
 
-    this._history = [ ...commits.map(c => c.sha), ...existingHistory ]
+    this._history = [...commits.map(c => c.sha), ...existingHistory]
     this.storeCommits(commits)
 
     this.requestsInFight.delete(LoadingHistoryRequestKey)
@@ -175,18 +185,28 @@ export class GitStore {
 
   /** Load the next batch of history, starting from the last loaded commit. */
   public async loadNextHistoryBatch() {
-    if (this.requestsInFight.has(LoadingHistoryRequestKey)) { return }
+    if (this.requestsInFight.has(LoadingHistoryRequestKey)) {
+      return
+    }
 
-    if (!this.history.length) { return }
+    if (!this.history.length) {
+      return
+    }
 
     const lastSHA = this.history[this.history.length - 1]
     const requestKey = `history/${lastSHA}`
-    if (this.requestsInFight.has(requestKey)) { return }
+    if (this.requestsInFight.has(requestKey)) {
+      return
+    }
 
     this.requestsInFight.add(requestKey)
 
-    const commits = await this.performFailableOperation(() => getCommits(this.repository, `${lastSHA}^`, CommitBatchSize))
-    if (!commits) { return }
+    const commits = await this.performFailableOperation(() =>
+      getCommits(this.repository, `${lastSHA}^`, CommitBatchSize)
+    )
+    if (!commits) {
+      return
+    }
 
     this._history = this._history.concat(commits.map(c => c.sha))
     this.storeCommits(commits)
@@ -198,13 +218,17 @@ export class GitStore {
   }
 
   /** The list of ordered SHAs. */
-  public get history(): ReadonlyArray<string> { return this._history }
+  public get history(): ReadonlyArray<string> {
+    return this._history
+  }
 
   /** Load all the branches. */
   public async loadBranches() {
-    const [ localAndRemoteBranches, recentBranchNames ] = await Promise.all([
+    const [localAndRemoteBranches, recentBranchNames] = await Promise.all([
       this.performFailableOperation(() => getBranches(this.repository)) || [],
-      this.performFailableOperation(() => getRecentBranches(this.repository, RecentBranchesLimit)),
+      this.performFailableOperation(() =>
+        getRecentBranches(this.repository, RecentBranchesLimit)
+      ),
     ])
 
     if (!localAndRemoteBranches) {
@@ -231,7 +255,9 @@ export class GitStore {
    * remote branches, i.e. remote branches that we already have a local
    * branch tracking.
    */
-  private mergeRemoteAndLocalBranches(branches: ReadonlyArray<Branch>): ReadonlyArray<Branch> {
+  private mergeRemoteAndLocalBranches(
+    branches: ReadonlyArray<Branch>
+  ): ReadonlyArray<Branch> {
     const localBranches = new Array<Branch>()
     const remoteBranches = new Array<Branch>()
 
@@ -277,62 +303,96 @@ export class GitStore {
     if (defaultBranchName) {
       // Find the default branch among all of our branches, giving
       // priority to local branches by sorting them before remotes
-      this._defaultBranch = this._allBranches
-        .filter(b => b.name === defaultBranchName)
-        .sort((x, y) => compare(x.type, y.type))
-        .shift() || null
+      this._defaultBranch =
+        this._allBranches
+          .filter(b => b.name === defaultBranchName)
+          .sort((x, y) => compare(x.type, y.type))
+          .shift() || null
     } else {
       this._defaultBranch = null
     }
   }
 
-  private refreshRecentBranches(recentBranchNames: ReadonlyArray<string> | undefined) {
+  private refreshRecentBranches(
+    recentBranchNames: ReadonlyArray<string> | undefined
+  ) {
     if (!recentBranchNames || !recentBranchNames.length) {
       this._recentBranches = []
       return
     }
 
-    const branchesByName = this._allBranches
-      .reduce((map, branch) =>
-        map.set(branch.name, branch), new Map<string, Branch>())
+    const branchesByName = this._allBranches.reduce(
+      (map, branch) => map.set(branch.name, branch),
+      new Map<string, Branch>()
+    )
 
     const recentBranches = new Array<Branch>()
-      for (const name of recentBranchNames) {
-        const branch = branchesByName.get(name)
-        if (!branch) {
-          // This means the recent branch has been deleted. That's fine.
-          continue
-        }
-
-        recentBranches.push(branch)
+    for (const name of recentBranchNames) {
+      const branch = branchesByName.get(name)
+      if (!branch) {
+        // This means the recent branch has been deleted. That's fine.
+        continue
       }
+
+      recentBranches.push(branch)
+    }
 
     this._recentBranches = recentBranches
   }
 
   /** The current branch. */
-  public get tip(): Tip { return this._tip }
+  public get tip(): Tip {
+    return this._tip
+  }
 
   /** The default branch, or `master` if there is no default. */
-  public get defaultBranch(): Branch | null { return this._defaultBranch }
+  public get defaultBranch(): Branch | null {
+    return this._defaultBranch
+  }
 
   /** All branches, including the current branch and the default branch. */
-  public get allBranches(): ReadonlyArray<Branch> { return this._allBranches }
+  public get allBranches(): ReadonlyArray<Branch> {
+    return this._allBranches
+  }
 
   /** The most recently checked out branches. */
-  public get recentBranches(): ReadonlyArray<Branch> { return this._recentBranches }
+  public get recentBranches(): ReadonlyArray<Branch> {
+    return this._recentBranches
+  }
 
-  /** Load the local commits. */
-  public async loadLocalCommits(branch: Branch): Promise<void> {
+  /**
+   * Load local commits into memory for the current repository.
+   *
+   * @param branch The branch to query for unpublished commits.
+   *
+   * If the tip of the repository does not have commits (i.e. is unborn), this
+   * should be invoked with `null`, which clears any existing commits from the
+   * store.
+   */
+  public async loadLocalCommits(branch: Branch | null): Promise<void> {
+    if (branch === null) {
+      this._localCommitSHAs = []
+      return
+    }
+
     let localCommits: ReadonlyArray<Commit> | undefined
     if (branch.upstream) {
       const revRange = `${branch.upstream}..${branch.name}`
-      localCommits = await this.performFailableOperation(() => getCommits(this.repository, revRange, CommitBatchSize))
+      localCommits = await this.performFailableOperation(() =>
+        getCommits(this.repository, revRange, CommitBatchSize)
+      )
     } else {
-      localCommits = await this.performFailableOperation(() => getCommits(this.repository, 'HEAD', CommitBatchSize, [ '--not', '--remotes' ]))
+      localCommits = await this.performFailableOperation(() =>
+        getCommits(this.repository, 'HEAD', CommitBatchSize, [
+          '--not',
+          '--remotes',
+        ])
+      )
     }
 
-    if (!localCommits) { return }
+    if (!localCommits) {
+      return
+    }
 
     this.storeCommits(localCommits)
     this._localCommitSHAs = localCommits.map(c => c.sha)
@@ -364,10 +424,13 @@ export class GitStore {
     // will make the branch unborn again.
     let success: true | undefined = undefined
     if (commit.parentSHAs.length === 0) {
-      success = await this.performFailableOperation(() => deleteRef(this.repository, 'HEAD',
-      'Reverting first commit'))
+      success = await this.performFailableOperation(() =>
+        deleteRef(this.repository, 'HEAD', 'Reverting first commit')
+      )
     } else {
-      success = await this.performFailableOperation(() => reset(this.repository, GitResetMode.Mixed, commit.parentSHAs[0]))
+      success = await this.performFailableOperation(() =>
+        reset(this.repository, GitResetMode.Mixed, commit.parentSHAs[0])
+      )
     }
 
     if (success) {
@@ -387,14 +450,18 @@ export class GitStore {
    * @param errorMetadata - The metadata which should be attached to any errors
    *                        that are thrown.
    */
-  public async performFailableOperation<T>(fn: () => Promise<T>, errorMetadata?: IErrorMetadata): Promise<T | undefined> {
+  public async performFailableOperation<T>(
+    fn: () => Promise<T>,
+    errorMetadata?: IErrorMetadata
+  ): Promise<T | undefined> {
     try {
       const result = await fn()
       return result
     } catch (e) {
-      if (errorMetadata) {
-        e = new ErrorWithMetadata(e, errorMetadata)
-      }
+      e = new ErrorWithMetadata(e, {
+        repository: this.repository,
+        ...errorMetadata,
+      })
 
       this.emitError(e)
       return undefined
@@ -414,18 +481,30 @@ export class GitStore {
     return this._contextualCommitMessage
   }
 
-
   /**
-   * Fetch all remotes, using the given account for authentication.
+   * Fetch the default remote, using the given account for authentication.
    *
    * @param account          - The account to use for authentication if needed.
    * @param backgroundTask   - Was the fetch done as part of a background task?
    * @param progressCallback - A function that's called with information about
    *                           the overall fetch progress.
    */
-  public async fetchAll(account: Account | null, backgroundTask: boolean, progressCallback?: (fetchProgress: IFetchProgress) => void): Promise<void> {
-    const remotes = await getRemotes(this.repository)
-    return this.fetchRemotes(account, remotes, backgroundTask, progressCallback)
+  public async fetch(
+    account: IGitAccount | null,
+    backgroundTask: boolean,
+    progressCallback?: (fetchProgress: IFetchProgress) => void
+  ): Promise<void> {
+    const remote = this.remote
+    if (!remote) {
+      return Promise.resolve()
+    }
+
+    return this.fetchRemotes(
+      account,
+      [remote],
+      backgroundTask,
+      progressCallback
+    )
   }
 
   /**
@@ -437,8 +516,12 @@ export class GitStore {
    * @param progressCallback - A function that's called with information about
    *                           the overall fetch progress.
    */
-  public async fetchRemotes(account: Account | null, remotes: ReadonlyArray<IRemote>, backgroundTask: boolean, progressCallback?: (fetchProgress: IFetchProgress) => void): Promise<void> {
-
+  public async fetchRemotes(
+    account: IGitAccount | null,
+    remotes: ReadonlyArray<IRemote>,
+    backgroundTask: boolean,
+    progressCallback?: (fetchProgress: IFetchProgress) => void
+  ): Promise<void> {
     if (!remotes.length) {
       return
     }
@@ -449,11 +532,11 @@ export class GitStore {
       const remote = remotes[i]
       const startProgressValue = i * weight
 
-      await this.fetchRemote(account, remote.name, backgroundTask, (progress) => {
+      await this.fetchRemote(account, remote.name, backgroundTask, progress => {
         if (progress && progressCallback) {
           progressCallback({
             ...progress,
-            value: startProgressValue + (progress.value * weight),
+            value: startProgressValue + progress.value * weight,
           })
         }
       })
@@ -469,10 +552,22 @@ export class GitStore {
    * @param progressCallback - A function that's called with information about
    *                           the overall fetch progress.
    */
-  public async fetchRemote(account: Account | null, remote: string, backgroundTask: boolean, progressCallback?: (fetchProgress: IFetchProgress) => void): Promise<void> {
-    await this.performFailableOperation(() => {
-      return fetchRepo(this.repository, account, remote, progressCallback)
-    }, { backgroundTask })
+  public async fetchRemote(
+    account: IGitAccount | null,
+    remote: string,
+    backgroundTask: boolean,
+    progressCallback?: (fetchProgress: IFetchProgress) => void
+  ): Promise<void> {
+    const retryAction: RetryAction = {
+      type: RetryActionType.Fetch,
+      repository: this.repository,
+    }
+    await this.performFailableOperation(
+      () => {
+        return fetchRepo(this.repository, account, remote, progressCallback)
+      },
+      { backgroundTask, retryAction }
+    )
   }
 
   /**
@@ -484,19 +579,22 @@ export class GitStore {
    *                  information on refspecs: https://www.git-scm.com/book/tr/v2/Git-Internals-The-Refspec
    *
    */
-  public async fetchRefspec(account: Account | null, refspec: string): Promise<void> {
-
+  public async fetchRefspec(
+    account: IGitAccount | null,
+    refspec: string
+  ): Promise<void> {
     // TODO: we should favour origin here
     const remotes = await getRemotes(this.repository)
 
     for (const remote of remotes) {
-      await this.performFailableOperation(() => fetchRefspec(this.repository, account, remote.name, refspec))
+      await this.performFailableOperation(() =>
+        fetchRefspec(this.repository, account, remote.name, refspec)
+      )
     }
   }
 
   /** Calculate the ahead/behind for the current branch. */
   public async calculateAheadBehindForCurrentBranch(): Promise<void> {
-
     if (this.tip.kind === TipState.Valid) {
       const branch = this.tip.branch
       this._aheadBehind = await getBranchAheadBehind(this.repository, branch)
@@ -507,7 +605,8 @@ export class GitStore {
 
   public async loadStatus(): Promise<IStatusResult | null> {
     const status = await this.performFailableOperation(() =>
-      getStatus(this.repository))
+      getStatus(this.repository)
+    )
 
     if (!status) {
       return null
@@ -518,11 +617,13 @@ export class GitStore {
     const { currentBranch, currentTip } = status
 
     if (currentBranch || currentTip) {
-
       if (currentTip && currentBranch) {
         const cachedCommit = this.commits.get(currentTip)
-        const branchTipCommit = cachedCommit || await this.performFailableOperation(() =>
-          getCommit(this.repository, currentTip))
+        const branchTipCommit =
+          cachedCommit ||
+          (await this.performFailableOperation(() =>
+            getCommit(this.repository, currentTip)
+          ))
 
         if (!branchTipCommit) {
           throw new Error(`Could not load commit ${currentTip}`)
@@ -532,7 +633,7 @@ export class GitStore {
           currentBranch,
           status.currentUpstreamBranch || null,
           branchTipCommit,
-          BranchType.Local,
+          BranchType.Local
         )
         this._tip = { kind: TipState.Valid, branch }
       } else if (currentTip) {
@@ -580,10 +681,14 @@ export class GitStore {
    * It will be `null` if ahead/behind hasn't been calculated yet, or if the
    * branch doesn't have an upstream.
    */
-  public get aheadBehind(): IAheadBehind | null { return this._aheadBehind }
+  public get aheadBehind(): IAheadBehind | null {
+    return this._aheadBehind
+  }
 
   /** Get the remote we're working with. */
-  public get remote(): IRemote | null { return this._remote }
+  public get remote(): IRemote | null {
+    return this._remote
+  }
 
   public setCommitMessage(message: ICommitMessage | null): Promise<void> {
     this._commitMessage = message
@@ -592,7 +697,9 @@ export class GitStore {
   }
 
   /** The date the repository was last fetched. */
-  public get lastFetched(): Date | null { return this._lastFetched }
+  public get lastFetched(): Date | null {
+    return this._lastFetched
+  }
 
   /** Update the last fetched date. */
   public updateLastFetched(): Promise<void> {
@@ -622,7 +729,9 @@ export class GitStore {
 
   /** Changes the URL for the remote that matches the given name  */
   public async setRemoteURL(name: string, url: string): Promise<void> {
-    await this.performFailableOperation(() => setRemoteURL(this.repository, name, url))
+    await this.performFailableOperation(() =>
+      setRemoteURL(this.repository, name, url)
+    )
     await this.loadCurrentRemote()
 
     this.emitUpdate()
@@ -663,7 +772,7 @@ export class GitStore {
   public async saveGitIgnore(text: string): Promise<void> {
     const repository = this.repository
     const ignorePath = Path.join(repository.path, '.gitignore')
-    const fileContents = ensureTrailingNewline(text)
+    const fileContents = await formatGitIgnoreContents(text, repository)
 
     return new Promise<void>((resolve, reject) => {
       Fs.writeFile(ignorePath, fileContents, err => {
@@ -678,36 +787,52 @@ export class GitStore {
 
   /** Ignore the given path or pattern. */
   public async ignore(pattern: string): Promise<void> {
-    const text = await this.readGitIgnore() || ''
-    const currentContents = ensureTrailingNewline(text)
-    const newText = ensureTrailingNewline(`${currentContents}${pattern}`)
+    const text = (await this.readGitIgnore()) || ''
+    const repository = this.repository
+    const currentContents = await formatGitIgnoreContents(text, repository)
+    const newText = await formatGitIgnoreContents(
+      `${currentContents}${pattern}`,
+      repository
+    )
     await this.saveGitIgnore(newText)
 
     await removeFromIndex(this.repository, pattern)
   }
 
-  public async discardChanges(files: ReadonlyArray<WorkingDirectoryFileChange>): Promise<void> {
-
+  public async discardChanges(
+    files: ReadonlyArray<WorkingDirectoryFileChange>
+  ): Promise<void> {
     const onDiskFiles = files.filter(f => OnDiskStatuses.has(f.status))
-    const absolutePaths = onDiskFiles.map(f => Path.join(this.repository.path, f.path))
+    const absolutePaths = onDiskFiles.map(f =>
+      Path.join(this.repository.path, f.path)
+    )
     for (const path of absolutePaths) {
       this.shell.moveItemToTrash(path)
     }
 
-    const touchesGitIgnore = files.some(f => Path.basename(f.path) === '.gitignore')
+    const touchesGitIgnore = files.some(
+      f => Path.basename(f.path) === '.gitignore'
+    )
     if (touchesGitIgnore && this.tip.kind === TipState.Valid) {
       const ref = await this.tip.branch.name
-      await this.performFailableOperation(() => reset(this.repository, GitResetMode.Mixed, ref))
+      await this.performFailableOperation(() =>
+        reset(this.repository, GitResetMode.Mixed, ref)
+      )
     }
 
     const modifiedFiles = files.filter(f => CommittedStatuses.has(f.status))
 
     if (modifiedFiles.length) {
       // in case any files have been staged outside Desktop - renames and copies do this by default
-      await this.performFailableOperation(() => reset(this.repository, GitResetMode.Mixed, 'HEAD'))
+      await this.performFailableOperation(() =>
+        reset(this.repository, GitResetMode.Mixed, 'HEAD')
+      )
 
       const pathsToCheckout = modifiedFiles.map(f => {
-        if (f.status === FileStatus.Copied || f.status === FileStatus.Renamed) {
+        if (
+          f.status === AppFileStatus.Copied ||
+          f.status === AppFileStatus.Renamed
+        ) {
           // because of the above reset, we now need to discard the old path for these
           return f.oldPath!
         } else {
@@ -715,7 +840,9 @@ export class GitStore {
         }
       })
 
-      await this.performFailableOperation(() => checkoutPaths(this.repository, pathsToCheckout))
+      await this.performFailableOperation(() =>
+        checkoutPaths(this.repository, pathsToCheckout)
+      )
     }
   }
 
@@ -726,11 +853,25 @@ export class GitStore {
     // In the case where we're in the middle of a merge, we're gonna keep
     // finding the same merge message over and over. We don't need to keep
     // telling the world.
-    if (existingMessage && message && structuralEquals(existingMessage, message)) {
+    if (
+      existingMessage &&
+      message &&
+      structuralEquals(existingMessage, message)
+    ) {
       return
     }
 
     this._contextualCommitMessage = message
+    this.emitUpdate()
+  }
+
+  /** Reverts the commit with the given SHA */
+  public async revertCommit(
+    repository: Repository,
+    commit: Commit
+  ): Promise<void> {
+    await this.performFailableOperation(() => revertCommit(repository, commit))
+
     this.emitUpdate()
   }
 
@@ -752,7 +893,8 @@ export class GitStore {
           }
 
           // exclude any commented-out lines from the MERGE_MSG body
-          let description: string | null = pieces[2].split('\n')
+          let description: string | null = pieces[2]
+            .split('\n')
             .filter(line => line[0] !== '#')
             .join('\n')
 
@@ -771,14 +913,45 @@ export class GitStore {
   }
 }
 
-function ensureTrailingNewline(text: string): string {
-  // mixed line endings might be an issue here
-  if (!text.endsWith('\n')) {
-    const linesEndInCRLF = text.indexOf('\r\n')
-    return linesEndInCRLF === -1
-      ? `${text}\n`
-      : `${text}\r\n`
-  } else {
-    return text
-  }
+/**
+ * Format the gitignore text based on the current config settings.
+ *
+ * This setting looks at core.autocrlf to decide which line endings to use
+ * when updating the .gitignore file.
+ *
+ * If core.safecrlf is also set, adding this file to the index may cause
+ * Git to return a non-zero exit code, leaving the working directory in a
+ * confusing state for the user. So we should reformat the file in that
+ * case.
+ *
+ * @param text The text to format.
+ * @param repository The repository associated with the gitignore file.
+ */
+async function formatGitIgnoreContents(
+  text: string,
+  repository: Repository
+): Promise<string> {
+  const autocrlf = await getConfigValue(repository, 'core.autocrlf')
+  const safecrlf = await getConfigValue(repository, 'core.safecrlf')
+
+  return new Promise<string>((resolve, reject) => {
+    if (autocrlf === 'true' && safecrlf === 'true') {
+      // based off https://stackoverflow.com/a/141069/1363815
+      const normalizedText = text.replace(/\r\n|\n\r|\n|\r/g, '\r\n')
+      resolve(normalizedText)
+      return
+    }
+
+    if (text.endsWith('\n')) {
+      resolve(text)
+      return
+    }
+
+    const linesEndInCRLF = autocrlf === 'true'
+    if (linesEndInCRLF) {
+      resolve(`${text}\n`)
+    } else {
+      resolve(`${text}\r\n`)
+    }
+  })
 }

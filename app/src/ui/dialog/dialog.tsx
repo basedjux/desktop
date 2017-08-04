@@ -1,6 +1,7 @@
 import * as React from 'react'
 import * as classNames from 'classnames'
 import { DialogHeader } from './header'
+import { createUniqueId, releaseUniqueId } from '../lib/id-pool'
 
 /**
  * The time (in milliseconds) from when the dialog is mounted
@@ -8,6 +9,11 @@ import { DialogHeader } from './header'
  * IDialogState for more information.
  */
 const dismissGracePeriodMs = 250
+
+/**
+ * Title bar height in pixels. Values taken from 'app/styles/_variables.scss'.
+ */
+const titleBarHeight = __DARWIN__ ? 22 : 28
 
 interface IDialogProps {
   /**
@@ -106,6 +112,14 @@ interface IDialogState {
    * grace period or not.
    */
   readonly isAppearing: boolean
+
+  /**
+   * An optional id for the h1 element that contains the title of this
+   * dialog. Used to aid in accessibility by allowing the h1 to be referenced
+   * in an aria-labeledby/aria-describedby attributed. Undefined if the dialog
+   * does not have a title or the component has not yet been mounted.
+   */
+  readonly titleId?: string
 }
 
 /**
@@ -117,7 +131,6 @@ interface IDialogState {
  * out of the dialog without first dismissing it.
  */
 export class Dialog extends React.Component<IDialogProps, IDialogState> {
-
   private dialogElement: HTMLElement | null = null
   private dismissGraceTimeoutId?: number
 
@@ -135,7 +148,10 @@ export class Dialog extends React.Component<IDialogProps, IDialogState> {
 
   private scheduleDismissGraceTimeout() {
     this.clearDismissGraceTimeout()
-    this.dismissGraceTimeoutId = window.setTimeout(this.onDismissGraceTimer, dismissGracePeriodMs)
+    this.dismissGraceTimeoutId = window.setTimeout(
+      this.onDismissGraceTimer,
+      dismissGracePeriodMs
+    )
   }
 
   private onDismissGraceTimer = () => {
@@ -146,10 +162,28 @@ export class Dialog extends React.Component<IDialogProps, IDialogState> {
     return this.props.dismissable === undefined || this.props.dismissable
   }
 
+  private updateTitleId() {
+    if (this.state.titleId) {
+      releaseUniqueId(this.state.titleId)
+      this.setState({ titleId: undefined })
+    }
+
+    if (this.props.title) {
+      this.setState({
+        titleId: createUniqueId(`Dialog_${this.props.id}_${this.props.title}`),
+      })
+    }
+  }
+
+  public componentWillMount() {
+    this.updateTitleId()
+  }
+
   public componentDidMount() {
     // This cast to any is necessary since React doesn't know about the
     // dialog element yet.
-    (this.dialogElement as any).showModal()
+    // tslint:disable-next-line:whitespace
+    ;(this.dialogElement as any).showModal()
 
     this.setState({ isAppearing: true })
     this.scheduleDismissGraceTimeout()
@@ -157,6 +191,16 @@ export class Dialog extends React.Component<IDialogProps, IDialogState> {
 
   public componentWillUnmount() {
     this.clearDismissGraceTimeout()
+
+    if (this.state.titleId) {
+      releaseUniqueId(this.state.titleId)
+    }
+  }
+
+  public componentDidUpdate() {
+    if (!this.props.title && this.state.titleId) {
+      this.updateTitleId()
+    }
   }
 
   private onDialogCancel = (e: Event) => {
@@ -165,8 +209,7 @@ export class Dialog extends React.Component<IDialogProps, IDialogState> {
   }
 
   private onDialogClick = (e: React.MouseEvent<HTMLElement>) => {
-
-    if (!this.isDismissable) {
+    if (this.isDismissable() === false) {
       return
     }
 
@@ -176,6 +219,12 @@ export class Dialog extends React.Component<IDialogProps, IDialogState> {
     // want so we'll make sure that the original target for the event is
     // our own dialog element.
     if (e.target !== this.dialogElement) {
+      return
+    }
+
+    const isInTitleBar = e.clientY <= titleBarHeight
+
+    if (isInTitleBar) {
       return
     }
 
@@ -245,34 +294,38 @@ export class Dialog extends React.Component<IDialogProps, IDialogState> {
     return (
       <DialogHeader
         title={this.props.title}
+        titleId={this.state.titleId}
         dismissable={this.isDismissable()}
         onDismissed={this.onDismiss}
-        type={this.props.type}
         loading={this.props.loading}
       />
     )
   }
 
   public render() {
-
-    const className = classNames({
-      error: this.props.type === 'error',
-      warning: this.props.type === 'warning',
-    }, this.props.className)
+    const className = classNames(
+      {
+        error: this.props.type === 'error',
+        warning: this.props.type === 'warning',
+      },
+      this.props.className
+    )
 
     return (
       <dialog
         ref={this.onDialogRef}
         id={this.props.id}
         onClick={this.onDialogClick}
-        className={className}>
-          {this.renderHeader()}
+        className={className}
+        aria-labelledby={this.state.titleId}
+      >
+        {this.renderHeader()}
 
-          <form onSubmit={this.onSubmit} autoFocus>
-            <fieldset disabled={this.props.disabled}>
-              {this.props.children}
-            </fieldset>
-          </form>
+        <form onSubmit={this.onSubmit} autoFocus={true}>
+          <fieldset disabled={this.props.disabled}>
+            {this.props.children}
+          </fieldset>
+        </form>
       </dialog>
     )
   }

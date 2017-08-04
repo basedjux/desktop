@@ -15,15 +15,50 @@ export const SamplesURL = 'https://desktop.github.com/usage-data/'
 
 const LastDailyStatsReportKey = 'last-daily-stats-report'
 
+/** The localStorage key for whether the user has opted out. */
+const StatsOptOutKey = 'stats-opt-out'
+
+/** Have we successfully sent the stats opt-in? */
+const HasSentOptInPingKey = 'has-sent-stats-opt-in-ping'
+
 /** How often daily stats should be submitted (i.e., 24 hours). */
 const DailyStatsReportInterval = 1000 * 60 * 60 * 24
 
 const DefaultDailyMeasures: IDailyMeasures = {
   commits: 0,
+  partialCommits: 0,
   openShellCount: 0,
 }
 
-type DailyStats = { version: string } & ILaunchStats & IDailyMeasures
+interface ICalculatedStats {
+  /** The app version. */
+  readonly version: string
+
+  /** The OS version. */
+  readonly osVersion: string
+
+  /** The platform. */
+  readonly platform: string
+
+  /** The number of total repositories. */
+  readonly repositoryCount: number
+
+  /** The number of GitHub repositories. */
+  readonly gitHubRepositoryCount: number
+
+  /** The install ID. */
+  readonly guid: string
+
+  /** Is the user logged in with a GitHub.com account? */
+  readonly dotComAccount: boolean
+
+  /** Is the user logged in with an Enterprise account? */
+  readonly enterpriseAccount: boolean
+
+  readonly eventType: 'usage'
+}
+
+type DailyStats = ICalculatedStats & ILaunchStats & IDailyMeasures
 
 /** The store for the app's stats. */
 export class StatsStore {
@@ -35,9 +70,15 @@ export class StatsStore {
   public constructor(db: StatsDatabase) {
     this.db = db
 
-    const optOutValue = localStorage.getItem('stats-opt-out')
+    const optOutValue = localStorage.getItem(StatsOptOutKey)
     if (optOutValue) {
       this.optOut = !!parseInt(optOutValue, 10)
+
+      // If the user has set an opt out value but we haven't sent the ping yet,
+      // give it a shot now.
+      if (!localStorage.getItem(HasSentOptInPingKey)) {
+        this.sendOptInStatusPing(!this.optOut)
+      }
     } else {
       this.optOut = false
     }
@@ -60,8 +101,13 @@ export class StatsStore {
   }
 
   /** Report any stats which are eligible for reporting. */
-  public async reportStats(accounts: ReadonlyArray<Account>, repositories: ReadonlyArray<Repository>) {
-    if (this.optOut) { return }
+  public async reportStats(
+    accounts: ReadonlyArray<Account>,
+    repositories: ReadonlyArray<Repository>
+  ) {
+    if (this.optOut) {
+      return
+    }
 
     // Never report stats while in dev or test. They could be pretty crazy.
     if (__DEV__ || process.env.TEST_ENV) {
@@ -80,27 +126,21 @@ export class StatsStore {
 
     const now = Date.now()
     const stats = await this.getDailyStats(accounts, repositories)
-    const options = {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(stats),
-    }
 
     try {
-      const response = await fetch(StatsEndpoint, options)
+      const response = await this.post(stats)
       if (!response.ok) {
-        throw new Error(`Unexpected status: ${response.statusText} (${response.status})`)
+        throw new Error(
+          `Unexpected status: ${response.statusText} (${response.status})`
+        )
       }
 
-      console.log('Stats reported.')
+      log.info('Stats reported.')
 
       await this.clearDailyStats()
       localStorage.setItem(LastDailyStatsReportKey, now.toString())
     } catch (e) {
-      console.error('Error reporting stats:')
-      console.error(e)
+      log.error('Error reporting stats:', e)
     }
   }
 
@@ -116,13 +156,17 @@ export class StatsStore {
   }
 
   /** Get the daily stats. */
-  private async getDailyStats(accounts: ReadonlyArray<Account>, repositories: ReadonlyArray<Repository>): Promise<DailyStats> {
+  private async getDailyStats(
+    accounts: ReadonlyArray<Account>,
+    repositories: ReadonlyArray<Repository>
+  ): Promise<DailyStats> {
     const launchStats = await this.getAverageLaunchStats()
     const dailyMeasures = await this.getDailyMeasures()
     const userType = this.determineUserType(accounts)
     const repositoryCounts = this.categorizedRepositoryCounts(repositories)
 
     return {
+      eventType: 'usage',
       version: getVersion(),
       osVersion: getOS(),
       platform: process.platform,
@@ -137,14 +181,19 @@ export class StatsStore {
   private categorizedRepositoryCounts(repositories: ReadonlyArray<Repository>) {
     return {
       repositoryCount: repositories.length,
-      gitHubRepositoryCount: repositories.filter(r => r.gitHubRepository).length,
+      gitHubRepositoryCount: repositories.filter(r => r.gitHubRepository)
+        .length,
     }
   }
 
   /** Determines if an account is a dotCom and/or enterprise user */
   private determineUserType(accounts: ReadonlyArray<Account>) {
-    const dotComAccount = !!accounts.find(a => a.endpoint === getDotComAPIEndpoint())
-    const enterpriseAccount = !!accounts.find(a => a.endpoint !== getDotComAPIEndpoint())
+    const dotComAccount = !!accounts.find(
+      a => a.endpoint === getDotComAPIEndpoint()
+    )
+    const enterpriseAccount = !!accounts.find(
+      a => a.endpoint !== getDotComAPIEndpoint()
+    )
 
     return {
       dotComAccount,
@@ -154,7 +203,9 @@ export class StatsStore {
 
   /** Calculate the average launch stats. */
   private async getAverageLaunchStats(): Promise<ILaunchStats> {
-    const launches: ReadonlyArray<ILaunchStats> | undefined = await this.db.launches.toArray()
+    const launches:
+      | ReadonlyArray<ILaunchStats>
+      | undefined = await this.db.launches.toArray()
     if (!launches || !launches.length) {
       return {
         mainReadyTime: -1,
@@ -173,7 +224,8 @@ export class StatsStore {
       return {
         mainReadyTime: running.mainReadyTime + current.mainReadyTime,
         loadTime: running.loadTime + current.loadTime,
-        rendererReadyTime: running.rendererReadyTime + current.rendererReadyTime,
+        rendererReadyTime:
+          running.rendererReadyTime + current.rendererReadyTime,
       }
     }, start)
 
@@ -186,7 +238,9 @@ export class StatsStore {
 
   /** Get the daily measures. */
   private async getDailyMeasures(): Promise<IDailyMeasures> {
-    const measures: IDailyMeasures | undefined = await this.db.dailyMeasures.limit(1).first()
+    const measures:
+      | IDailyMeasures
+      | undefined = await this.db.dailyMeasures.limit(1).first()
     return {
       ...DefaultDailyMeasures,
       ...measures,
@@ -195,11 +249,15 @@ export class StatsStore {
     }
   }
 
-  private async updateDailyMeasures<K extends keyof IDailyMeasures>(fn: (measures: IDailyMeasures) => Pick<IDailyMeasures, K>): Promise<void> {
+  private async updateDailyMeasures<K extends keyof IDailyMeasures>(
+    fn: (measures: IDailyMeasures) => Pick<IDailyMeasures, K>
+  ): Promise<void> {
     const db = this.db
     const defaultMeasures = DefaultDailyMeasures
     await this.db.transaction('rw', this.db.dailyMeasures, function*() {
-      const measures: IDailyMeasures | null = yield db.dailyMeasures.limit(1).first()
+      const measures: IDailyMeasures | null = yield db.dailyMeasures
+        .limit(1)
+        .first()
       const measuresWithDefaults = {
         ...defaultMeasures,
         ...measures,
@@ -217,6 +275,13 @@ export class StatsStore {
     }))
   }
 
+  /** Record that a partial commit was accomplished. */
+  public recordPartialCommit(): Promise<void> {
+    return this.updateDailyMeasures(m => ({
+      partialCommits: m.partialCommits + 1,
+    }))
+  }
+
   /** Record that the user opened a shell. */
   public recordOpenShell(): Promise<void> {
     return this.updateDailyMeasures(m => ({
@@ -225,14 +290,54 @@ export class StatsStore {
   }
 
   /** Set whether the user has opted out of stats reporting. */
-  public setOptOut(optOut: boolean) {
+  public async setOptOut(optOut: boolean): Promise<void> {
+    const changed = this.optOut !== optOut
+
     this.optOut = optOut
 
-    localStorage.setItem('stats-opt-out', optOut ? '1' : '0')
+    localStorage.setItem(StatsOptOutKey, optOut ? '1' : '0')
+
+    if (changed) {
+      await this.sendOptInStatusPing(!optOut)
+    }
   }
 
   /** Has the user opted out of stats reporting? */
   public getOptOut(): boolean {
     return this.optOut
+  }
+
+  /** Post some data to our stats endpoint. */
+  private post(body: object): Promise<Response> {
+    const options = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    }
+
+    return fetch(StatsEndpoint, options)
+  }
+
+  private async sendOptInStatusPing(optIn: boolean): Promise<void> {
+    const direction = optIn ? 'in' : 'out'
+    try {
+      const response = await this.post({
+        eventType: 'ping',
+        optIn,
+      })
+      if (!response.ok) {
+        throw new Error(
+          `Unexpected status: ${response.statusText} (${response.status})`
+        )
+      }
+
+      localStorage.setItem(HasSentOptInPingKey, '1')
+
+      log.info(`Opt ${direction} reported.`)
+    } catch (e) {
+      log.error(`Error reporting opt ${direction}:`, e)
+    }
   }
 }
